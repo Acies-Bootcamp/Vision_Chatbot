@@ -3,11 +3,12 @@ import io, base64, json
 from PIL import Image
 import streamlit as st
 from google import genai   # new SDK
+import os
+from dotenv import load_dotenv
 
-# -----------------------------
-# HARD-CODED SETTINGS
-# -----------------------------
-GEMINI_API_KEY = "AIzaSyAthKAfQTGNNI8s-3oeA2UlcBHOJezBJVQ"
+
+load_dotenv()  # reads .env file
+api_key = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = "gemini-2.0-flash"               # free, fast, multimodal
 
 # -----------------------------
