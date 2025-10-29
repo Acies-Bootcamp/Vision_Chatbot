@@ -1,27 +1,31 @@
 import os
 import io
 import base64
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Dict, Any
 
 import streamlit as st
 from dotenv import load_dotenv
+from PIL import Image
 from google import genai  # pip install google-genai
 
 # =========================
 # App Config
 # =========================
 st.set_page_config(page_title="Gemini Chart Analyzer", page_icon="📊", layout="wide")
+st.title("📊 Gemini Chart Analyzer")
 
-# Session state defaults
+# =========================
+# Session State Defaults
+# =========================
 def _init_state():
-    st.session_state.setdefault("uploads", [])  # list of dicts: {name, data(bytes), img(PIL), b64(str)}
+    st.session_state.setdefault("uploads", [])   # [{name, data, img, b64, mime}]
     st.session_state.setdefault("analysis_summary", "")
     st.session_state.setdefault("model_name", "gemini-2.0-flash")
-    st.session_state.setdefault("level", "Business (concise)")
     st.session_state.setdefault("word_limit", 200)
     st.session_state.setdefault("output_style", "Structured (bulleted)")
     st.session_state.setdefault("conversation", [])
-    st.session_state.setdefault("prompt_text", "")
+    st.session_state.setdefault("audience", "Business Professional")  # only audience
+
 _init_state()
 
 # =========================
@@ -37,77 +41,14 @@ client = genai.Client(api_key=API_KEY)
 MODEL_CHOICES = ["gemini-2.0-flash", "gemini-2.0-pro"]
 
 # =========================
-# Controls row
+# Small Utilities
 # =========================
-def render_controls_row():
-    c1, c2, c3, c4 = st.columns([1.3, 1.3, 1.3, 1.0])
-    with c1:
-        st.session_state.model_name = st.selectbox(
-            "Model",
-            MODEL_CHOICES,
-            index=(MODEL_CHOICES.index(st.session_state.model_name)
-                   if st.session_state.model_name in MODEL_CHOICES else 0),
-            help="Use flash for speed (free tier), pro for higher quality if available."
-        )
-    with c2:
-        st.session_state.level = st.selectbox(
-            "Tone",
-            ["Business (concise)", "Scientific (detailed)"],
-            index=0 if st.session_state.level.startswith("Business") else 1
-        )
-    with c3:
-        st.session_state.word_limit = st.slider(
-            "Word limit",
-            min_value=80, max_value=600, value=st.session_state.word_limit, step=20
-        )
-    with c4:
-        st.session_state.output_style = st.selectbox(
-            "Output format",
-            ["Structured (bulleted)", "Narrative (story)"],
-            index=(0 if st.session_state.output_style.startswith("Structured") else 1)
-        )
-
-# =========================
-# Prompt builder
-# =========================
-def build_prompt(level: str, word_limit: int, output_style: str) -> str:
-    if level.startswith("Business"):
-        audience = "Audience: business stakeholders; avoid jargon; crisp, decision-focused."
-    else:
-        audience = "Audience: technical stakeholders; be precise and analytical."
-    if output_style == "Structured (bulleted)":
-        head = f"You are analyzing chart images (bar/line/pie/scatter). {audience}\n"
-        instr = (
-            "For each chart, provide bullet points covering:\n"
-            "- **Chart:** file name or title (if available)\n"
-            "- **Axes:** x-axis label (unit) and y-axis label (unit)\n"
-            "- **Data series:** names of series\n"
-            "- **Summary:** key trends or changes\n"
-            "- **Max:** highest value and where\n"
-            "- **Min:** lowest value and where\n"
-            "- **Anomalies:** any unusual data points or drops/spikes\n"
-            "- **Insights:** actionable observations (3 bullet points)\n\n"
-            "After all charts, include a section **Overall Summary:** with bullet points combining insights across charts.\n"
-            f"Keep the output under {word_limit} words, in Markdown format."
-        )
-        return head + instr
-    else:
-        body = (
-            f"You are a senior data storyteller. {audience}\n"
-            "Write an insightful narrative based on the uploaded charts.\n\n"
-            "Requirements:\n"
-            "1) Start with a bold one-line headline capturing the key message.\n"
-            f"2) Use 2–3 short paragraphs (<= {word_limit} words total) describing the changes and importance.\n"
-            "3) Mention leading series, magnitudes, and any anomalies or reversals.\n"
-            "4) End with three action-oriented bullet points.\n"
-            "Write in Markdown (no JSON)."
-        )
-        return body
-
-# =========================
-# Image helpers
-# =========================
-from PIL import Image
+def guess_mime(name: str) -> str:
+    nl = name.lower()
+    if nl.endswith(".png"): return "image/png"
+    if nl.endswith(".webp"): return "image/webp"
+    if nl.endswith(".bmp"): return "image/bmp"
+    return "image/jpeg"
 
 def decode_uploaded_files(files) -> List[Dict[str, Any]]:
     out = []
@@ -124,13 +65,141 @@ def decode_uploaded_files(files) -> List[Dict[str, Any]]:
             st.warning(f"⚠️ Skipping {f.name}: not a valid image ({e})")
             continue
         b64 = base64.b64encode(data).decode("utf-8")
-        out.append({"name": f.name, "data": data, "img": img, "b64": b64})
+        out.append({
+            "name": f.name, "data": data, "img": img, "b64": b64, "mime": guess_mime(f.name)
+        })
     return out
+
+def _overview_and_bullets(word_limit: int):
+    short = word_limit <= 150
+    overview_lines = "1–2 lines" if short else "2–3 lines"
+    bullet_points = "3–4 bullet points" if short else "5–6 bullet points"
+    length_instruction = "Keep it concise." if short else "Elaborate clearly but stay focused."
+    return overview_lines, bullet_points, length_instruction
+
+# =========================
+# Gemini Call (per chart)
+# =========================
+def generate_individual_insight_from_rec(
+    rec: Dict[str, Any],
+    audience: str,
+    word_limit: int,
+    model_name: str,
+    output_style: str
+) -> str:
+    overview_lines, bullet_points, length_instruction = _overview_and_bullets(word_limit)
+    tone_note = "business-friendly" if audience == "Business Professional" else "technically precise"
+
+    prompt = f"""
+You are a professional data analyst. Analyze the uploaded chart image and provide a structured, professional response.
+
+Audience: {audience}.
+Instructions:
+1) Begin with an overview summary ({overview_lines}).
+2) Follow with key findings and insights ({bullet_points}).
+3) Keep the tone {tone_note}.
+4) {length_instruction}
+5) Keep total length near {word_limit} words.
+6) {"Use concise bullets." if output_style.startswith("Structured") else "Write it as a short narrative paragraph."}
+"""
+
+    contents = [{
+        "role": "user",
+        "parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": rec["mime"], "data": rec["b64"]}},
+        ],
+    }]
+
+    try:
+        response = client.models.generate_content(model=model_name, contents=contents)
+        return (getattr(response, "text", "") or "").strip() or "No insights generated."
+    except Exception as e:
+        return f"API Error: {e}"
+
+# =========================
+# Colors and Styles
+# =========================
+PALE_PINK = "#FFDDEE"
+PEACH = "#FFE5B4"
+
+st.markdown(
+    f"""
+    <style>
+    /* Style Streamlit tabs for Home and Ask */
+    div[data-testid="stHorizontalBlock"] > div:nth-child(1) > div[data-testid="stTab"] {{
+        background-color: {PALE_PINK} !important;
+        border-radius: 5px 5px 0 0 !important;
+        padding: 10px 15px !important;
+    }}
+    div[data-testid="stHorizontalBlock"] > div:nth-child(2) > div[data-testid="stTab"] {{
+        background-color: {PEACH} !important;
+        border-radius: 5px 5px 0 0 !important;
+        padding: 10px 15px !important;
+    }}
+
+    /* Style for horizontal control row */
+    .control-row > div {{
+        display: inline-block;
+        vertical-align: middle;
+        margin-right: 12px;
+        background: #fff0f5;
+        border-radius: 8px;
+        padding: 8px 12px;
+    }}
+
+    /* Adjust chat message box colors for clarity */
+    [data-testid="stChatMessage"] {{
+        max-width: 80%;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# =========================
+# Controls row with dynamic word limit based on audience
+# =========================
+def render_controls_row():
+    cols = st.columns([1.3, 1.3, 1.3, 1.3], gap="large")
+    with cols[0]:
+        st.session_state.model_name = st.selectbox(
+            "Model",
+            MODEL_CHOICES,
+            index=(MODEL_CHOICES.index(st.session_state.model_name)
+                   if st.session_state.model_name in MODEL_CHOICES else 0),
+            help="Use flash for speed; pro for higher quality."
+        )
+    with cols[1]:
+        max_word_limit = 300 if st.session_state.audience == "Business Professional" else 600
+        # Clamp current word_limit inside max for audience
+        if st.session_state.word_limit > max_word_limit:
+            st.session_state.word_limit = max_word_limit
+        st.session_state.word_limit = st.slider(
+            "Word limit", min_value=80, max_value=max_word_limit,
+            value=st.session_state.word_limit, step=20
+        )
+    with cols[2]:
+        st.session_state.output_style = st.selectbox(
+            "Output format",
+            ["Structured (bulleted)", "Narrative (story)"],
+            index=(0 if st.session_state.output_style.startswith("Structured") else 1)
+        )
+    with cols[3]:
+        st.session_state.audience = st.selectbox(
+            "Audience",
+            ["Business Professional", "Data Scientist"],
+            index=0 if st.session_state.audience == "Business Professional" else 1
+        )
+
+st.markdown('<div class="control-row">', unsafe_allow_html=True)
+render_controls_row()
+st.markdown('</div>', unsafe_allow_html=True)
+
 
 # =========================
 # Main App
 # =========================
-render_controls_row()
 home_tab, ask_tab = st.tabs(["Home", "Ask"])
 
 with home_tab:
@@ -141,44 +210,36 @@ with home_tab:
     )
     if files:
         st.session_state.uploads = decode_uploaded_files(files)
-    if st.session_state.uploads:
-        with st.expander("Preview Charts", expanded=True):
-            cols = st.columns(min(4, len(st.session_state.uploads)))
-            for i, rec in enumerate(st.session_state.uploads):
-                cols[i % len(cols)].image(rec["img"], caption=rec["name"], use_container_width=True)
 
-    auto_prompt = build_prompt(
-        level=st.session_state.level,
-        word_limit=st.session_state.word_limit,
-        output_style=st.session_state.output_style
-    )
-    st.session_state.prompt_text = st.text_area(
-        "Prompt (editable):",
-        value=auto_prompt,
-        height=200
-    )
     analyze = st.button("🔍 Analyze Charts", type="primary")
+
     if analyze:
         if not st.session_state.uploads:
-            st.warning("Please upload one or more chart images first.")
+            st.error("Please upload at least one chart to analyze.")
         else:
-            contents = [{"role": "user", "parts": [{"text": st.session_state.prompt_text}]}]
-            for rec in st.session_state.uploads:
-                contents[0]["parts"].append({"inline_data": {"mime_type": "image/png", "data": rec["b64"]}})
-            with st.spinner(f"Analyzing charts with {st.session_state.model_name}..."):
-                try:
-                    result = client.models.generate_content(
-                        model=st.session_state.model_name,
-                        contents=contents
-                    )
-                    output_text = result.text or ""
-                except Exception as e:
-                    st.error(f"API Error: {e}")
-                    st.stop()
-            st.session_state.analysis_summary = output_text[:4000]
-            st.success("Analysis complete.")
-            st.subheader("Analysis Result")
-            st.markdown(output_text)
+            model_name = st.session_state.model_name
+            audience = st.session_state.audience
+            word_limit = st.session_state.word_limit
+            output_style = st.session_state.output_style
+
+            summary_blocks = []
+
+            # Individual analysis only
+            for idx, rec in enumerate(st.session_state.uploads, start=1):
+                st.markdown(f"### Chart {idx} — {rec['name']}")
+                col_chart, col_insight = st.columns([1, 2], gap="large")
+                with col_chart:
+                    st.image(rec["img"], caption=rec["name"], use_container_width=True)
+                with col_insight:
+                    with st.spinner(f"Analyzing {rec['name']} with {model_name}..."):
+                        insight = generate_individual_insight_from_rec(
+                            rec, audience, word_limit, model_name, output_style
+                        )
+                    st.markdown(insight)
+                    summary_blocks.append(f"Chart {idx} ({rec['name']}):\n{insight}")
+
+            st.session_state.analysis_summary = "\n\n---\n\n".join(summary_blocks)
+            st.success("✅ Analysis complete. Switch to the **Ask** tab to query the results.")
 
 with ask_tab:
     st.header("❓ Ask a question about the charts")
@@ -199,13 +260,16 @@ with ask_tab:
                         model=st.session_state.model_name,
                         contents=contents
                     )
-                    answer = res.text or ""
+                    answer = (res.text or "").strip()
                 except Exception as e:
                     st.error(f"API Error: {e}")
-                    st.stop()
-            st.session_state.conversation.append({"user": user_input, "assistant": answer})
+                    answer = ""
+            if answer:
+                st.session_state.conversation.append({"user": user_input, "assistant": answer})
+
         for msg in st.session_state.conversation:
             st.chat_message("user").markdown(msg["user"])
             st.chat_message("assistant").markdown(msg["assistant"])
+
         with st.expander("Analysis Summary", expanded=False):
             st.markdown(st.session_state.analysis_summary)
