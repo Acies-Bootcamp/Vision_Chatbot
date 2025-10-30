@@ -1,144 +1,46 @@
-# app.py — Minimal 3-tab app (Home, Ask, History) with hidden-preview history + chat download
+# app.py — Chartify: Minimal 3-tab app with hidden preview + chat download
+# -----------------------------------------------------------------------
+# Quick Start:
+#   1) pip install streamlit python-dotenv pillow tinydb reportlab google-genai groq
+#   2) put GEMINI_API_KEY=... and GROQ_API_KEY=... in a .env file
+#   3) streamlit run app.py
+#
+# Tabs:
+#   • Home     → upload charts, run Single/Cross analysis, export PDF
+#   • Chat Bot → ask follow-ups using ONLY the latest analysis (hidden preview)
+#   • History  → browse/delete previous runs (with thumbnails)
+# -----------------------------------------------------------------------
+
 import os
-import io
-import base64
-import tempfile
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import streamlit as st
 from dotenv import load_dotenv
 from PIL import Image
+from tinydb import TinyDB, where
 
-# === LLM SDKs ===
-from google import genai as google_genai   # pip install google-genai
-from groq import Groq                      # pip install groq
+# Import only what we actually use from tools.py
+from tools import (
+    blue_theme_css, decode_uploaded_files, build_pdf_bytes,
+    generate_individual_insight_from_rec, generate_cross_chart_insight,
+    save_analysis, load_latest_analysis, load_analyses,
+    make_thumbnails, thumbnails_gallery, build_chat_markdown, _clear_current_run
+)
 
-# PDF (reportlab)
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-
-# ============== TinyDB (simple global history, no threads) =================
-from tinydb import TinyDB
+# Local DB handle (same filename as tools.py uses)
 DB = TinyDB("analysis_history_db.json")
 
-def _now_iso():
-    return datetime.utcnow().isoformat()
-
-def _summarize_line(text: str, words: int = 10) -> str:
-    if not text:
-        return ""
-    # take first non-empty line
-    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
-    if not line:
-        return ""
-    toks = line.split()
-    short = " ".join(toks[:words])
-    if len(toks) > words:
-        short += "…"
-    return short
-
-def _make_history_title(payload: Dict[str, Any]) -> str:
-    mode = payload.get("analysis_mode", "Single Chart Analysis")
-    if mode.startswith("Cross"):
-        base = _summarize_line(payload.get("combined_insight", "")) or "Cross-chart summary"
-        return f"Cross • {base}"
-    # Single: try first detail -> “<file>: <first few insight words>”
-    details = payload.get("analysis_details", [])
-    if details:
-        first = details[0]
-        name = first.get("name", "Chart")
-        peek = _summarize_line(first.get("insight", ""), 8) or "Insights"
-        return f"{name} • {peek}"
-    # Fallback from summary
-    base = _summarize_line(payload.get("analysis_summary", ""), 10) or "Single-chart summary"
-    return f"Single • {base}"
-
-def save_analysis(payload: Dict[str, Any]):
-    analyses = DB.table("analyses")
-    title = _make_history_title(payload)
-    analyses.insert({"ts": _now_iso(), "title": title, **payload})
-
-def load_analyses() -> List[Dict[str, Any]]:
-    analyses = DB.table("analyses")
-    items = analyses.all()
-    items = sorted(items, key=lambda d: d.get("ts", ""), reverse=True)
-    for it in items:
-        it.setdefault("title", "")
-        it.setdefault("analysis_mode", "Single Chart Analysis")
-        it.setdefault("analysis_summary", "")
-        it.setdefault("analysis_details", [])
-        it.setdefault("combined_insight", "")
-        it.setdefault("thumbnails", [])
-    return items
-
-def load_latest_analysis() -> Dict[str, Any]:
-    items = load_analyses()
-    return items[0] if items else {}
-
-# =========================
-# App Config
-# =========================
-st.set_page_config(page_title="Gemini Chart Analyzer", page_icon="📊", layout="wide")
+# =============================================================================
+# Streamlit page + theme
+# =============================================================================
+st.set_page_config(page_title="Chartify", page_icon="📊", layout="wide")
 st.title("📊 Chartify")
-
-# --- Blue Light UI (drop-in) ---
-def blue_theme_css():
-    st.markdown("""
-    <style>
-      :root{
-        --primary:#1e88e5; --primary-700:#1976d2; --primary-100:#e3f2fd;
-        --bg:#ffffff; --bg-soft:#f5f9ff; --text:#0f172a; --muted:#64748b;
-        --card:#ffffff; --shadow:0 6px 24px rgba(30,136,229,0.08); --radius:14px;
-      }
-      .block-container{max-width: 1100px !important;}
-      body { background: linear-gradient(180deg, var(--bg) 0%, var(--bg-soft) 100%) !important; }
-      h1,h2,h3,h4 { color: var(--primary-700) !important; }
-      [data-baseweb="tab-list"]{ border-bottom: 1px solid #e6eefc; }
-      [data-baseweb="tab"]{ color: var(--muted); font-weight: 600; }
-      [aria-selected="true"][data-baseweb="tab"]{ color: var(--primary-700) !important; border-bottom: 3px solid var(--primary) !important; }
-      [data-testid="stSidebar"]{
-        background: linear-gradient(180deg, var(--primary-100) 0%, #ffffff 70%);
-        border-right: 1px solid #e6eefc;
-      }
-      [data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{
-        color: var(--primary-700) !important;
-      }
-      .stButton > button, .stDownloadButton > button{
-        background: var(--primary) !important; color: white !important; border: none !important;
-        border-radius: var(--radius) !important; box-shadow: var(--shadow) !important;
-        transition: transform .03s ease-in-out, filter .15s ease;
-      }
-      .stButton > button:hover, .stDownloadButton > button:hover{ filter: brightness(1.05); }
-      .stButton > button:active, .stDownloadButton > button:active{ transform: translateY(1px); }
-      [data-testid="stFileUploader"]{
-        background: var(--card); padding: 14px 16px; border-radius: var(--radius);
-        box-shadow: var(--shadow); border: 1px solid #e6eefc;
-      }
-      [data-testid="stExpander"]{
-        background: var(--card); border-radius: var(--radius);
-        border: 1px solid #e6eefc; box-shadow: var(--shadow);
-      }
-      [data-testid="stExpander"] summary{ color: var(--primary-700); font-weight: 600; }
-      .stAlert{ border-radius: var(--radius); box-shadow: var(--shadow); border: 1px solid #e6eefc; }
-      .analysis-card{
-        background: var(--card); padding: 16px 18px; border-radius: var(--radius);
-        border: 1px solid #e6eefc; box-shadow: var(--shadow); margin-bottom: 14px;
-      }
-      .history-label{
-        font-weight: 600; color: #0f172a;
-      }
-      .history-sub{ color: #64748b; font-size: 0.9rem; }
-      img{ border-radius: 10px; }
-    </style>
-    """, unsafe_allow_html=True)
 
 blue_theme_css()
 
-# =========================
-# Session State Defaults
-# =========================
+# =============================================================================
+# Session State (what we keep between reruns)
+# =============================================================================
 def _init_state():
     st.session_state.setdefault("uploads", [])                 # [{name, data, img, b64, mime}]
     st.session_state.setdefault("analysis_summary", "")
@@ -147,6 +49,7 @@ def _init_state():
     st.session_state.setdefault("analysis_done", False)
     st.session_state.setdefault("pdf_bytes", None)
     st.session_state.setdefault("latest_thumbs", [])
+    st.session_state.setdefault("rendered_inline", False)      # prevents double-render after progressive flow
 
     # settings
     st.session_state.setdefault("model_name", "gemini-2.0-flash")  # default
@@ -165,242 +68,15 @@ def _init_state():
 
 _init_state()
 
-# =========================
-# Env & Clients
-# =========================
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
-
-google_client: Optional[google_genai.Client] = None
-groq_client: Optional[Groq] = None
-
-if GEMINI_API_KEY:
-    google_client = google_genai.Client(api_key=GEMINI_API_KEY)
-if GROQ_API_KEY:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-
-# Available models (Groq vision model updated to a supported one)
+# Supported models (one Google, one Groq multimodal)
 MODEL_CHOICES = [
-    "gemini-2.0-flash",                         # Google GenAI (vision via inline_data)
-    "meta-llama/llama-4-scout-17b-16e-instruct" # Groq multimodal (text+image)
+    "gemini-2.0-flash",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
 ]
 
-# =========================
-# Helpers
-# =========================
-def guess_mime(name: str) -> str:
-    nl = name.lower()
-    if nl.endswith(".png"): return "image/png"
-    if nl.endswith(".webp"): return "image/webp"
-    if nl.endswith(".bmp"): return "image/bmp"
-    if nl.endswith(".jpg") or nl.endswith(".jpeg"): return "image/jpeg"
-    return "image/png"
-
-def decode_uploaded_files(files) -> List[Dict[str, Any]]:
-    out = []
-    if not files:
-        return out
-    for f in files:
-        data = f.getvalue()
-        if not data or len(data) < 10:
-            continue
-        try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
-        except Exception:
-            continue
-        b64 = base64.b64encode(data).decode("utf-8")
-        out.append({"name": f.name, "data": data, "img": img, "b64": b64, "mime": guess_mime(f.name)})
-    return out
-
-def _clear_current_run():
-    st.session_state.uploads = []
-    st.session_state.analysis_summary = ""
-    st.session_state.analysis_details = []
-    st.session_state.combined_insight = ""
-    st.session_state.analysis_done = False
-    st.session_state.pdf_bytes = None
-    st.session_state.latest_thumbs = []
-
-def _ensure_backend(model_name: str) -> str:
-    """
-    Return backend type: 'google' or 'groq'. Raise helpful errors if key/client missing.
-    """
-    if model_name.startswith("gemini"):
-        if not google_client:
-            raise RuntimeError("GEMINI_API_KEY missing. Set it in .env.")
-        return "google"
-    else:
-        if not groq_client:
-            raise RuntimeError("GROQ_API_KEY missing. Set it in .env.")
-        return "groq"
-
-def _call_google_generate(model_name: str, parts: list) -> str:
-    res = google_client.models.generate_content(
-        model=model_name,
-        contents=[{"role": "user", "parts": parts}]
-    )
-    return (getattr(res, "text", "") or "").strip()
-
-def _call_groq_generate(model_name: str, parts: list) -> str:
-    """
-    Build Groq-compatible 'messages[0].content' where each item is either:
-      {"type":"text","text":"..."} OR {"type":"image_url","image_url":{"url":"data:..."}}
-    """
-    groq_content = []
-    for p in parts:
-        if "text" in p:
-            groq_content.append({"type": "text", "text": p["text"]})
-        elif "inline_data" in p:
-            mime = p["inline_data"].get("mime_type", "image/png")
-            b64  = p["inline_data"].get("data", "")
-            data_url = f"data:{mime};base64,{b64}"
-            groq_content.append({"type": "image_url", "image_url": {"url": data_url}})
-
-    resp = groq_client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": groq_content if groq_content else ""}],
-        temperature=0.2,
-        max_tokens=1200,
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-def _generate_with_backend(model_name: str, parts: list) -> str:
-    backend = _ensure_backend(model_name)
-    if backend == "google":
-        return _call_google_generate(model_name, parts)
-    else:
-        if len(parts) == 1 and "text" in parts[0]:
-            resp = groq_client.chat_completions.create(  # fallback in case of SDK differences
-                model=model_name,
-                messages=[{"role": "user", "content": parts[0]["text"]}],
-                temperature=0.2,
-                max_tokens=1200,
-            ) if hasattr(groq_client, "chat_completions") else groq_client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": parts[0]["text"]}],
-                temperature=0.2,
-                max_tokens=1200,
-            )
-            # Normalize
-            choice = getattr(resp, "choices", [])[0]
-            msg = getattr(choice, "message", None) or getattr(choice, "delta", None)
-            content = (getattr(msg, "content", None) if msg else None) or getattr(choice, "text", None)
-            return (content or "").strip()
-        return _call_groq_generate(model_name, parts)
-
-def generate_individual_insight_from_rec(rec, audience, model_name, output_style):
-    tone_note = "business-friendly" if audience == "Business Professional" else "technically precise"
-    prompt = f"""
-You are a professional data analyst. Analyze the uploaded chart image and provide a structured, professional response.
-Audience: {audience}.
-Instructions:
-1) Short overview.
-2) Key findings & insights.
-3) Tone: {tone_note}.
-4) {"Use concise bullets." if output_style.startswith("Structured") else "Write a short narrative paragraph."}
-"""
-    parts = [{"text": prompt}, {"inline_data": {"mime_type": rec["mime"], "data": rec["b64"]}}]
-    try:
-        text = _generate_with_backend(model_name, parts)
-        return text or "No insights generated."
-    except Exception as e:
-        return f"API Error: {e}"
-
-def generate_cross_chart_insight(recs, audience, model_name, output_style):
-    tone_note = "business-friendly" if audience == "Business Professional" else "technically precise"
-    prompt = f"""
-You are a professional data analyst. Analyze relationships and trends across all charts and provide a concise summary.
-Audience: {audience}.
-Instructions:
-1) Overall trends across charts.
-2) Comparisons/correlations/differences.
-3) Tone: {tone_note}.
-4) {"Use concise bullets." if output_style.startswith("Structured") else "Write a short narrative paragraph."}
-"""
-    parts = [{"text": prompt}]
-    for rec in recs:
-        parts.append({"inline_data": {"mime_type": rec["mime"], "data": rec["b64"]}})
-    try:
-        text = _generate_with_backend(model_name, parts)
-        return text or "No insights generated."
-    except Exception as e:
-        return f"API Error: {e}"
-
-def build_pdf_bytes(uploads, summary_text) -> bytes:
-    if not uploads or not summary_text:
-        return b""
-    styles = getSampleStyleSheet()
-    story = [
-        Paragraph("<b>📊 Gemini Chart Analysis Report</b>", styles["Title"]),
-        Spacer(1, 20),
-        Paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]),
-        Paragraph("Generated by: Gemini Chart Analyzer", styles["Normal"]),
-        Spacer(1, 20),
-    ]
-    temp_paths, pdf_path = [], None
-    try:
-        max_width = 440
-        for rec in uploads:
-            story.append(Paragraph(f"<b>{rec['name']}</b>", styles["Heading2"]))
-            img_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-            img_tmp.close()
-            temp_paths.append(img_tmp.name)
-            rec["img"].save(img_tmp.name)
-            story.append(RLImage(img_tmp.name, width=max_width))
-            story.append(Spacer(1, 10))
-        story.append(Paragraph("<b>Analysis Summary:</b>", styles["Heading2"]))
-        story.append(Paragraph(summary_text.replace("\n", "<br/>"), styles["Normal"]))
-        pdf_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf"); pdf_path = pdf_tmp.name; pdf_tmp.close()
-        doc = SimpleDocTemplate(pdf_path, pagesize=A4); doc.build(story)
-        with open(pdf_path, "rb") as f:
-            return f.read()
-    finally:
-        for p in temp_paths:
-            try: os.unlink(p)
-            except Exception: pass
-        if pdf_path:
-            try: os.unlink(pdf_path)
-            except Exception: pass
-
-def make_thumbnails(uploads: List[Dict[str, Any]], max_w=320) -> List[Dict[str, str]]:
-    thumbs = []
-    for rec in uploads:
-        img: Image.Image = rec["img"].copy()
-        w, h = img.size
-        if w > max_w:
-            new_h = int(h * (max_w / float(w)))
-            img = img.resize((max_w, new_h))
-        buf = io.BytesIO(); img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        thumbs.append({"name": rec["name"], "b64": b64})
-    return thumbs
-
-def thumbnails_gallery(thumbnails: List[Dict[str, str]]):
-    if not thumbnails: return
-    cols = st.columns(min(4, max(1, len(thumbnails))))
-    for i, th in enumerate(thumbnails):
-        with cols[i % len(cols)]:
-            st.image(f"data:image/png;base64,{th['b64']}", caption=th["name"], use_container_width=True)
-
-def build_chat_markdown(convo: List[Dict[str, str]]) -> str:
-    """Return a markdown transcript of the Ask tab chat."""
-    if not convo:
-        return "# Chat History\n\n_No chat yet._\n"
-    lines = ["# Chat History\n"]
-    for i, m in enumerate(convo, 1):
-        u = (m.get("user") or "").strip()
-        a = (m.get("assistant") or "").strip()
-        if u:
-            lines.append(f"**You {i}:** {u}")
-        if a:
-            lines.append(f"**Assistant {i}:** {a}")
-        lines.append("")  # blank line
-    return "\n".join(lines)
-
-# =========================
-# SIDEBAR — Workspace & Export
-# =========================
+# =============================================================================
+# Sidebar (Settings, Exports, Chat download)
+# =============================================================================
 with st.sidebar:
     st.header("🛠️ Workspace")
 
@@ -410,10 +86,10 @@ with st.sidebar:
         MODEL_CHOICES,
         index=(MODEL_CHOICES.index(st.session_state.model_name)
                if st.session_state.model_name in MODEL_CHOICES else 0),
-        help="Pick the engine used to analyze charts and answer follow-ups."
+        help="Engine used to analyze charts and answer follow-ups."
     )
 
-    # Analysis type
+    # Analysis scope
     st.session_state.analysis_mode = st.selectbox(
         "Analysis scope",
         ["Single Chart Analysis", "Cross Chart Analysis"],
@@ -426,18 +102,18 @@ with st.sidebar:
         "Answer style",
         ["Structured (bulleted)", "Narrative (story)"],
         index=(0 if st.session_state.output_style.startswith("Structured") else 1),
-        help="Choose concise bullets or a short narrative paragraph."
+        help="Choose concise bullets or a short narrative."
     )
 
-    # Audience
+    # Audience tone
     st.session_state.audience = st.selectbox(
         "Audience tone",
         ["Business Professional", "Data Scientist"],
         index=0 if st.session_state.audience == "Business Professional" else 1,
-        help="This tunes wording and emphasis in the insights."
+        help="Tunes wording and emphasis in the insights."
     )
 
-    # Detect ANY dropdown change → clear the Home run (uploads + outputs)
+    # Detect ANY change → clear current Home run (uploads + outputs)
     prev = st.session_state.prev_settings
     curr = (
         st.session_state.model_name,
@@ -458,8 +134,7 @@ with st.sidebar:
             st.session_state.pdf_bytes = None
         else:
             st.session_state.pdf_bytes = build_pdf_bytes(
-                st.session_state.uploads,
-                st.session_state.analysis_summary
+                st.session_state.uploads, st.session_state.analysis_summary
             )
             st.toast("📄 PDF is ready — click Download.", icon="✅")
 
@@ -484,14 +159,14 @@ with st.sidebar:
             key="chat_dl_btn"
         )
     else:
-        st.caption("No chat yet — ask a follow-up on the **Ask** tab to enable download.")
+        st.caption("No chat yet — ask a follow-up on the **Chat Bot** tab to enable download.")
 
-# =========================
-# TABS — Home | Ask | History
-# =========================t
-
+# =============================================================================
+# Tabs
+# =============================================================================
 home_tab, ask_tab, history_tab = st.tabs(["Home", "Chat Bot", "History"])
 
+# ── Home ───────────────────────────────────────────────────────────────────
 with home_tab:
     st.subheader("📥 Upload & Analyze")
     st.caption("Tip: For **Cross** analysis, upload multiple charts. For **Single**, you can still upload several; each gets its own insight.")
@@ -500,7 +175,7 @@ with home_tab:
         "Drop chart images",
         type=["png", "jpg", "jpeg", "webp", "bmp", "jfif"],
         accept_multiple_files=True,
-        help="Accepted: PNG, JPG, WEBP, BMP. Images only."
+        help="Accepted: PNG, JPG/JPEG, WEBP, BMP."
     )
     if files:
         decoded = decode_uploaded_files(files)
@@ -509,7 +184,7 @@ with home_tab:
 
     analyze = st.button("🔍 Run Analysis", type="primary")
 
-    # Cross: preview charts (hidden by default)
+    # Cross mode → offer a hidden preview of all charts
     if st.session_state.analysis_mode == "Cross Chart Analysis" and st.session_state.uploads:
         with st.expander("📉 Preview uploaded charts (optional)", expanded=False):
             recs = st.session_state.uploads
@@ -522,46 +197,90 @@ with home_tab:
         if not st.session_state.uploads:
             st.error("Please upload charts to analyze.")
         else:
-            model_name  = st.session_state.model_name
-            audience    = st.session_state.audience
-            output_style= st.session_state.output_style
-            mode        = st.session_state.analysis_mode
+            model_name   = st.session_state.model_name
+            audience     = st.session_state.audience
+            output_style = st.session_state.output_style
+            mode         = st.session_state.analysis_mode
 
+            # Reset current outputs
             st.session_state.analysis_details = []
             st.session_state.combined_insight = ""
-            summary_blocks = []
+            st.session_state.analysis_summary = ""
+            st.session_state.pdf_bytes = None
+            st.session_state.latest_thumbs = make_thumbnails(st.session_state.uploads)
+            st.session_state.rendered_inline = False
+
+            summary_blocks: List[str] = []
 
             if mode == "Single Chart Analysis":
+                # Progressive rendering area
+                st.markdown("### 📈 Current Result")
+                results_area = st.container()
+
                 for rec in st.session_state.uploads:
-                    with st.spinner(f"Analyzing {rec['name']}…"):
-                        insight = generate_individual_insight_from_rec(rec, audience, model_name, output_style)
+                    with results_area:
+                        st.markdown(f"#### {rec['name']}")
+                        col1, col2 = st.columns([1, 2])
+
+                        with col1:
+                            st.image(rec["img"], caption="Chart", use_container_width=True)
+
+                        with col2:
+                            insight_placeholder = st.empty()
+                            with st.spinner(f"Analyzing {rec['name']}…"):
+                                insight = generate_individual_insight_from_rec(
+                                    rec, audience, model_name, output_style
+                                )
+                            # show immediately
+                            insight_placeholder.markdown(insight)
+
+                    # update session + summary as we go (immediate persistence)
                     st.session_state.analysis_details.append({"name": rec["name"], "insight": insight})
                     summary_blocks.append(f"**{rec['name']}**\n\n{insight}")
+
+                # finalize shared summary for PDF/Chat
+                st.session_state.analysis_summary = "\n\n---\n\n".join(summary_blocks)
+                st.session_state.analysis_done = True
+                st.session_state.rendered_inline = True
+                st.toast("✅ Analysis complete.", icon="✅")
+
+                # Save to history with thumbnails + auto title
+                save_analysis({
+                    "analysis_mode": st.session_state.analysis_mode,
+                    "analysis_summary": st.session_state.analysis_summary,
+                    "analysis_details": st.session_state.analysis_details,
+                    "combined_insight": st.session_state.combined_insight,
+                    "thumbnails": st.session_state.latest_thumbs,
+                })
+
             else:
+                # Cross mode stays as a single combined call (cannot stream parts easily)
                 with st.spinner("Aggregating cross-chart insights…"):
-                    combined = generate_cross_chart_insight(st.session_state.uploads, audience, model_name, output_style)
+                    combined = generate_cross_chart_insight(
+                        st.session_state.uploads, audience, model_name, output_style
+                    )
                 st.session_state.combined_insight = combined
-                summary_blocks.append(combined)
+                st.session_state.analysis_summary = combined
+                st.session_state.analysis_done = True
+                st.toast("✅ Analysis complete.", icon="✅")
 
-            st.session_state.analysis_summary = "\n\n---\n\n".join(summary_blocks)
-            st.session_state.pdf_bytes = None
-            st.session_state.analysis_done = True
-            st.session_state.latest_thumbs = make_thumbnails(st.session_state.uploads)
-            st.toast("✅ Analysis complete.", icon="✅")
+                save_analysis({
+                    "analysis_mode": st.session_state.analysis_mode,
+                    "analysis_summary": st.session_state.analysis_summary,
+                    "analysis_details": st.session_state.analysis_details,
+                    "combined_insight": st.session_state.combined_insight,
+                    "thumbnails": st.session_state.latest_thumbs,
+                })
 
-            # Save to history (with thumbnails + auto title)
-            save_analysis({
-                "analysis_mode": st.session_state.analysis_mode,
-                "analysis_summary": st.session_state.analysis_summary,
-                "analysis_details": st.session_state.analysis_details,
-                "combined_insight": st.session_state.combined_insight,
-                "thumbnails": st.session_state.latest_thumbs
-            })
-
-    # Render CURRENT result (no history shown here)
-    if st.session_state.analysis_done and st.session_state.analysis_summary and st.session_state.uploads:
-        st.markdown("### 📈 Current Result")
+    # Render the CURRENT run (no history here) — skip if we already rendered inline
+    if (
+        st.session_state.analysis_done
+        and st.session_state.analysis_summary
+        and st.session_state.uploads
+        and not st.session_state.get("rendered_inline")
+    ):
         if st.session_state.analysis_mode == "Single Chart Analysis":
+            st.markdown("### 📈 Current Result")
             name_to_insight = {d["name"]: d["insight"] for d in st.session_state.analysis_details}
             for rec in st.session_state.uploads:
                 st.markdown(f"#### {rec['name']}")
@@ -574,10 +293,11 @@ with home_tab:
             st.subheader("🧠 Combined Cross-Chart Insights")
             st.markdown(st.session_state.combined_insight)
 
+# ── Chat Bot (Ask) ─────────────────────────────────────────────────────────
 with ask_tab:
     st.header("❓ Follow-up Q&A")
 
-    # hidden preview of latest analysis
+    # Hidden preview of the latest analysis for context
     with st.expander("🔎 Peek latest analysis (optional)", expanded=False):
         latest = load_latest_analysis()
         if latest:
@@ -599,10 +319,12 @@ with ask_tab:
                 st.rerun()
 
         if user_input:
+            # IMPORTANT: We answer strictly from the analysis summary (no images here)
             context = latest.get("analysis_summary", "")
             prompt = f"Answer based only on the analysis below.\n\n{context}\n\nQuestion: {user_input}"
-            parts = [{"text": prompt}]  # Ask tab is text-only
+            parts = [{"text": prompt}]
             with st.spinner("Thinking…"):
+                from tools import _generate_with_backend  # import here to keep top clean
                 try:
                     answer = _generate_with_backend(st.session_state.model_name, parts)
                 except Exception as e:
@@ -611,7 +333,7 @@ with ask_tab:
             st.toast("💬 Answer added to chat.", icon="✅")
             st.rerun()
 
-        # Chat history render (with empty-state message)
+        # Render chat messages
         if not st.session_state.conversation:
             st.info("No chat yet. Ask a question above.")
         else:
@@ -621,18 +343,44 @@ with ask_tab:
                 if msg.get("assistant"):
                     st.chat_message("assistant").markdown(msg["assistant"])
 
+# ── History ────────────────────────────────────────────────────────────────
 with history_tab:
     st.header("📚 Past Runs")
+
+    analyses_tbl = DB.table("analyses")
     items = load_analyses()
-    if not items:
-        st.info("No saved analyses yet.")
+
+    # Clear All
+    if items:
+        col1, col2 = st.columns([0.85, 0.15])
+        with col1:
+            st.caption(f"Showing {len(items)} saved analyses.")
+        with col2:
+            if st.button("🧹 Clear All History", use_container_width=True):
+                analyses_tbl.truncate()
+                st.toast("🧽 All history cleared from database.", icon="✅")
+                st.rerun()
     else:
-        for h in items:
-            ts = h.get('ts','')[:19].replace('T',' ')
-            title = h.get("title") or ("Single" if h.get('analysis_mode','').startswith('Single') else "Cross")
-            label = f"{ts} — {title}"
-            with st.expander(label, expanded=False):
-                if h.get("thumbnails"):
-                    thumbnails_gallery(h["thumbnails"])
-                    st.markdown("---")
-                st.markdown(h.get("analysis_summary",""))
+        st.info("No saved analyses yet.")
+
+    # Cards
+    for h in items:
+        ts = h.get("ts", "")[:19].replace("T", " ")
+        title = h.get("title") or ("Single" if h.get("analysis_mode", "").startswith("Single") else "Cross")
+        label = f"{ts} — {title}"
+
+        cols = st.columns([0.95, 0.05])
+        with cols[0]:
+            exp = st.expander(label, expanded=False)
+        with cols[1]:
+            # Use timestamp as stable key for delete
+            if st.button("✖️", key=f"del_{ts}"):
+                analyses_tbl.remove(where("ts") == h["ts"])
+                st.toast(f"Deleted history entry from {ts}", icon="🗑️")
+                st.rerun()
+
+        with exp:
+            if h.get("thumbnails"):
+                thumbnails_gallery(h["thumbnails"])
+                st.markdown("---")
+            st.markdown(h.get("analysis_summary", ""))
