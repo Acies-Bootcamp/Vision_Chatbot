@@ -2,35 +2,26 @@ import os
 import io
 import base64
 from typing import List, Dict, Any
-
 import streamlit as st
 from dotenv import load_dotenv
 from PIL import Image
-from google import genai  # pip install google-genai
+from google import genai
 
-# =========================
-# App Config
-# =========================
 st.set_page_config(page_title="Gemini Chart Analyzer", page_icon="📊", layout="wide")
 st.title("📊 Gemini Chart Analyzer")
 
-# =========================
-# Session State Defaults
-# =========================
 def _init_state():
-    st.session_state.setdefault("uploads", [])   # [{name, data, img, b64, mime}]
+    st.session_state.setdefault("uploads", [])
     st.session_state.setdefault("analysis_summary", "")
     st.session_state.setdefault("model_name", "gemini-2.0-flash")
-    st.session_state.setdefault("word_limit", 200)
     st.session_state.setdefault("output_style", "Structured (bulleted)")
     st.session_state.setdefault("conversation", [])
-    st.session_state.setdefault("audience", "Business Professional")  # only audience
+    st.session_state.setdefault("audience", "Business Professional")
+    st.session_state.setdefault("analysis_mode", "Single Chart Analysis")
 
 _init_state()
 
-# =========================
-# Env & Client
-# =========================
+# Load environment variables
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
@@ -40,9 +31,7 @@ if not API_KEY:
 client = genai.Client(api_key=API_KEY)
 MODEL_CHOICES = ["gemini-2.0-flash", "gemini-2.0-pro"]
 
-# =========================
-# Small Utilities
-# =========================
+# Helper functions
 def guess_mime(name: str) -> str:
     nl = name.lower()
     if nl.endswith(".png"): return "image/png"
@@ -70,39 +59,18 @@ def decode_uploaded_files(files) -> List[Dict[str, Any]]:
         })
     return out
 
-def _overview_and_bullets(word_limit: int):
-    short = word_limit <= 150
-    overview_lines = "1–2 lines" if short else "2–3 lines"
-    bullet_points = "3–4 bullet points" if short else "5–6 bullet points"
-    length_instruction = "Keep it concise." if short else "Elaborate clearly but stay focused."
-    return overview_lines, bullet_points, length_instruction
-
-# =========================
-# Gemini Call (per chart)
-# =========================
-def generate_individual_insight_from_rec(
-    rec: Dict[str, Any],
-    audience: str,
-    word_limit: int,
-    model_name: str,
-    output_style: str
-) -> str:
-    overview_lines, bullet_points, length_instruction = _overview_and_bullets(word_limit)
+def generate_individual_insight_from_rec(rec: Dict[str, Any], audience: str, model_name: str, output_style: str) -> str:
     tone_note = "business-friendly" if audience == "Business Professional" else "technically precise"
-
     prompt = f"""
 You are a professional data analyst. Analyze the uploaded chart image and provide a structured, professional response.
 
 Audience: {audience}.
 Instructions:
-1) Begin with an overview summary ({overview_lines}).
-2) Follow with key findings and insights ({bullet_points}).
+1) Begin with a short overview summary.
+2) Follow with key findings and insights.
 3) Keep the tone {tone_note}.
-4) {length_instruction}
-5) Keep total length near {word_limit} words.
-6) {"Use concise bullets." if output_style.startswith("Structured") else "Write it as a short narrative paragraph."}
+4) {"Use concise bullets." if output_style.startswith("Structured") else "Write it as a short narrative paragraph."}
 """
-
     contents = [{
         "role": "user",
         "parts": [
@@ -110,23 +78,40 @@ Instructions:
             {"inline_data": {"mime_type": rec["mime"], "data": rec["b64"]}},
         ],
     }]
-
     try:
         response = client.models.generate_content(model=model_name, contents=contents)
         return (getattr(response, "text", "") or "").strip() or "No insights generated."
     except Exception as e:
         return f"API Error: {e}"
 
-# =========================
-# Colors and Styles
-# =========================
+def generate_cross_chart_insight(recs: List[Dict[str, Any]], audience: str, model_name: str, output_style: str) -> str:
+    tone_note = "business-friendly" if audience == "Business Professional" else "technically precise"
+    prompt = f"""
+You are a professional data analyst. Analyze the relationship and trends across multiple charts and provide a structured summary.
+
+Audience: {audience}.
+Instructions:
+1) Summarize overall trends observed across all charts.
+2) Mention comparisons, correlations, or differences if visible.
+3) Keep the tone {tone_note}.
+4) {"Use concise bullets." if output_style.startswith("Structured") else "Write it as a short narrative paragraph."}
+"""
+    parts = [{"text": prompt}]
+    for rec in recs:
+        parts.append({"inline_data": {"mime_type": rec["mime"], "data": rec["b64"]}})
+    contents = [{"role": "user", "parts": parts}]
+    try:
+        response = client.models.generate_content(model=model_name, contents=contents)
+        return (getattr(response, "text", "") or "").strip() or "No insights generated."
+    except Exception as e:
+        return f"API Error: {e}"
+
+# Styling
 PALE_PINK = "#FFDDEE"
 PEACH = "#FFE5B4"
-
 st.markdown(
     f"""
     <style>
-    /* Style Streamlit tabs for Home and Ask */
     div[data-testid="stHorizontalBlock"] > div:nth-child(1) > div[data-testid="stTab"] {{
         background-color: {PALE_PINK} !important;
         border-radius: 5px 5px 0 0 !important;
@@ -137,8 +122,6 @@ st.markdown(
         border-radius: 5px 5px 0 0 !important;
         padding: 10px 15px !important;
     }}
-
-    /* Style for horizontal control row */
     .control-row > div {{
         display: inline-block;
         vertical-align: middle;
@@ -147,8 +130,6 @@ st.markdown(
         border-radius: 8px;
         padding: 8px 12px;
     }}
-
-    /* Adjust chat message box colors for clarity */
     [data-testid="stChatMessage"] {{
         max-width: 80%;
     }}
@@ -157,9 +138,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# =========================
-# Controls row with dynamic word limit based on audience
-# =========================
+# Control Panel
 def render_controls_row():
     cols = st.columns([1.3, 1.3, 1.3, 1.3], gap="large")
     with cols[0]:
@@ -171,13 +150,10 @@ def render_controls_row():
             help="Use flash for speed; pro for higher quality."
         )
     with cols[1]:
-        max_word_limit = 300 if st.session_state.audience == "Business Professional" else 600
-        # Clamp current word_limit inside max for audience
-        if st.session_state.word_limit > max_word_limit:
-            st.session_state.word_limit = max_word_limit
-        st.session_state.word_limit = st.slider(
-            "Word limit", min_value=80, max_value=max_word_limit,
-            value=st.session_state.word_limit, step=20
+        st.session_state.analysis_mode = st.selectbox(
+            "Analysis Type",
+            ["Single Chart Analysis", "Cross Chart Analysis"],
+            index=(0 if st.session_state.analysis_mode == "Single Chart Analysis" else 1)
         )
     with cols[2]:
         st.session_state.output_style = st.selectbox(
@@ -196,10 +172,7 @@ st.markdown('<div class="control-row">', unsafe_allow_html=True)
 render_controls_row()
 st.markdown('</div>', unsafe_allow_html=True)
 
-
-# =========================
-# Main App
-# =========================
+# Tabs
 home_tab, ask_tab = st.tabs(["Home", "Ask"])
 
 with home_tab:
@@ -213,30 +186,55 @@ with home_tab:
 
     analyze = st.button("🔍 Analyze Charts", type="primary")
 
+    # Dropdown preview (before or after analysis)
+    if st.session_state.analysis_mode == "Cross Chart Analysis" and st.session_state.uploads:
+        show_preview = st.selectbox("Show Chart Preview", ["No", "Yes"], index=0)
+        if show_preview == "Yes":
+            st.subheader("🖼️ Charts Preview")
+            recs = st.session_state.uploads
+            num_charts = len(recs)
+            cols_per_row = min(4, num_charts)
+            rows = (num_charts + cols_per_row - 1) // cols_per_row
+            for i in range(rows):
+                cols = st.columns(cols_per_row)
+                for j in range(cols_per_row):
+                    idx = i * cols_per_row + j
+                    if idx < num_charts:
+                        with cols[j]:
+                            rec = recs[idx]
+                            st.image(rec["img"], caption=rec["name"], use_container_width=True)
+
     if analyze:
         if not st.session_state.uploads:
             st.error("Please upload at least one chart to analyze.")
         else:
             model_name = st.session_state.model_name
             audience = st.session_state.audience
-            word_limit = st.session_state.word_limit
             output_style = st.session_state.output_style
-
+            analysis_mode = st.session_state.analysis_mode
             summary_blocks = []
 
-            # Individual analysis only
-            for idx, rec in enumerate(st.session_state.uploads, start=1):
-                st.markdown(f"### Chart {idx} — {rec['name']}")
-                col_chart, col_insight = st.columns([1, 2], gap="large")
-                with col_chart:
-                    st.image(rec["img"], caption=rec["name"], use_container_width=True)
-                with col_insight:
-                    with st.spinner(f"Analyzing {rec['name']} with {model_name}..."):
-                        insight = generate_individual_insight_from_rec(
-                            rec, audience, word_limit, model_name, output_style
-                        )
-                    st.markdown(insight)
-                    summary_blocks.append(f"Chart {idx} ({rec['name']}):\n{insight}")
+            if analysis_mode == "Single Chart Analysis":
+                for rec in st.session_state.uploads:
+                    st.markdown(f"### Chart — {rec['name']}")
+                    col_chart, col_insight = st.columns([1, 2], gap="large")
+                    with col_chart:
+                        st.image(rec["img"], caption=rec["name"], use_container_width=True)
+                    with col_insight:
+                        with st.spinner(f"Analyzing {rec['name']} with {model_name}..."):
+                            insight = generate_individual_insight_from_rec(
+                                rec, audience, model_name, output_style
+                            )
+                        st.markdown(insight)
+                        summary_blocks.append(f"{rec['name']}:\n{insight}")
+            else:
+                with st.spinner(f"Performing cross-chart analysis with {model_name}..."):
+                    cross_insight = generate_cross_chart_insight(
+                        st.session_state.uploads, audience, model_name, output_style
+                    )
+                st.subheader("Combined Cross-Chart Insights")
+                st.markdown(cross_insight)
+                summary_blocks.append(cross_insight)
 
             st.session_state.analysis_summary = "\n\n---\n\n".join(summary_blocks)
             st.success("✅ Analysis complete. Switch to the **Ask** tab to query the results.")
@@ -266,10 +264,8 @@ with ask_tab:
                     answer = ""
             if answer:
                 st.session_state.conversation.append({"user": user_input, "assistant": answer})
-
         for msg in st.session_state.conversation:
             st.chat_message("user").markdown(msg["user"])
             st.chat_message("assistant").markdown(msg["assistant"])
-
         with st.expander("Analysis Summary", expanded=False):
             st.markdown(st.session_state.analysis_summary)
