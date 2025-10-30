@@ -186,10 +186,9 @@ with home_tab:
 
     analyze = st.button("🔍 Analyze Charts", type="primary")
 
-    # Dropdown preview (before or after analysis)
+    # ✅ Collapsible preview instead of dropdown
     if st.session_state.analysis_mode == "Cross Chart Analysis" and st.session_state.uploads:
-        show_preview = st.selectbox("Show Chart Preview", ["No", "Yes"], index=0)
-        if show_preview == "Yes":
+        with st.expander("🖼️ Preview Charts", expanded=False):
             st.subheader("🖼️ Charts Preview")
             recs = st.session_state.uploads
             num_charts = len(recs)
@@ -269,3 +268,4 @@ with ask_tab:
             st.chat_message("assistant").markdown(msg["assistant"])
         with st.expander("Analysis Summary", expanded=False):
             st.markdown(st.session_state.analysis_summary)
+
