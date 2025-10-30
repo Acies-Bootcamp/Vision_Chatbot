@@ -1,109 +1,275 @@
-
-import io, base64, json
-from PIL import Image
-import streamlit as st
-from google import genai   # new SDK
 import os
+import io
+import base64
+from typing import List, Dict, Any
+
+import streamlit as st
 from dotenv import load_dotenv
+from PIL import Image
+from google import genai  # pip install google-genai
 
-
-load_dotenv()  # reads .env file
-api_key = os.getenv("GEMINI_API_KEY")
-MODEL_NAME = "gemini-2.0-flash"               # free, fast, multimodal
-
-# -----------------------------
-# SETUP
-# -----------------------------
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-st.set_page_config(page_title="Gemini Chart Analyzer", page_icon="📊")
+# =========================
+# App Config
+# =========================
+st.set_page_config(page_title="Gemini Chart Analyzer", page_icon="📊", layout="wide")
 st.title("📊 Gemini Chart Analyzer")
-st.caption("Upload multiple charts → structured JSON insights using Gemini 2.0")
 
-files = st.file_uploader(
-    "Upload chart images",
-    type=["png", "jpg", "jpeg", "webp"],
-    accept_multiple_files=True
-)
+# =========================
+# Session State Defaults
+# =========================
+def _init_state():
+    st.session_state.setdefault("uploads", [])   # [{name, data, img, b64, mime}]
+    st.session_state.setdefault("analysis_summary", "")
+    st.session_state.setdefault("model_name", "gemini-2.0-flash")
+    st.session_state.setdefault("word_limit", 200)
+    st.session_state.setdefault("output_style", "Structured (bulleted)")
+    st.session_state.setdefault("conversation", [])
+    st.session_state.setdefault("audience", "Business Professional")  # only audience
 
-default_prompt = (
-    "You are analyzing chart images (bar/line/pie/scatter). "
-    "For EACH image:\n"
-    "1) Identify axes (labels, units)\n"
-    "2) Summarize key trends\n"
-    "3) Find extrema (max/min)\n"
-    "4) Note anomalies\n"
-    "5) Give 3 concise insights\n\n"
-    "Return JSON FIRST as list of objects:\n"
-    "[{\"image\":\"<filename>\",\"axes\":{},\"summary\":\"\",\"insights\":[]}]"
-    "\nThen add line '---' and a short Markdown comparison."
-)
-user_prompt = st.text_area("Prompt", value=default_prompt, height=200)
+_init_state()
 
-def pil_to_b64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+# =========================
+# Env & Client
+# =========================
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+    st.error("⚠️ GEMINI_API_KEY missing. Create a .env file with GEMINI_API_KEY=your_key")
+    st.stop()
 
-# -----------------------------
-# RUN
-# -----------------------------
-if files and st.button("Analyze with Gemini"):
-    previews = []
-    parts = [{"role": "user", "parts": [{"text": user_prompt}]}]
+client = genai.Client(api_key=API_KEY)
+MODEL_CHOICES = ["gemini-2.0-flash", "gemini-2.0-pro"]
 
+# =========================
+# Small Utilities
+# =========================
+def guess_mime(name: str) -> str:
+    nl = name.lower()
+    if nl.endswith(".png"): return "image/png"
+    if nl.endswith(".webp"): return "image/webp"
+    if nl.endswith(".bmp"): return "image/bmp"
+    return "image/jpeg"
+
+def decode_uploaded_files(files) -> List[Dict[str, Any]]:
+    out = []
+    if not files:
+        return out
     for f in files:
-        data = f.read()
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        previews.append((f.name, img))
-        b64 = pil_to_b64(img)
-        parts[0]["parts"].append({
-            "inline_data": {"mime_type": "image/png", "data": b64}
-        })
-
-    with st.expander("Preview"):
-        cols = st.columns(min(3, len(previews)))
-        for i, (name, img) in enumerate(previews):
-            cols[i % len(cols)].image(img, caption=name, use_container_width=True)
-
-    with st.spinner(f"Analyzing with {MODEL_NAME}..."):
+        data = f.getvalue()
+        if not data or len(data) < 10:
+            st.warning(f"⚠️ {f.name} is empty or corrupted. Skipping.")
+            continue
         try:
-            result = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=parts
-            )
-            output_text = result.text
+            img = Image.open(io.BytesIO(data)).convert("RGB")
         except Exception as e:
-            st.error(f"API error: {e}")
-            st.stop()
+            st.warning(f"⚠️ Skipping {f.name}: not a valid image ({e})")
+            continue
+        b64 = base64.b64encode(data).decode("utf-8")
+        out.append({
+            "name": f.name, "data": data, "img": img, "b64": b64, "mime": guess_mime(f.name)
+        })
+    return out
 
-    st.subheader("Raw Model Output")
-    st.write(output_text)
+def _overview_and_bullets(word_limit: int):
+    short = word_limit <= 150
+    overview_lines = "1–2 lines" if short else "2–3 lines"
+    bullet_points = "3–4 bullet points" if short else "5–6 bullet points"
+    length_instruction = "Keep it concise." if short else "Elaborate clearly but stay focused."
+    return overview_lines, bullet_points, length_instruction
 
-    # --- Parse JSON if possible ---
-    json_block, comparison = None, None
-    if "---" in output_text:
-        json_block, comparison = output_text.split("---", 1)
+# =========================
+# Gemini Call (per chart)
+# =========================
+def generate_individual_insight_from_rec(
+    rec: Dict[str, Any],
+    audience: str,
+    word_limit: int,
+    model_name: str,
+    output_style: str
+) -> str:
+    overview_lines, bullet_points, length_instruction = _overview_and_bullets(word_limit)
+    tone_note = "business-friendly" if audience == "Business Professional" else "technically precise"
+
+    prompt = f"""
+You are a professional data analyst. Analyze the uploaded chart image and provide a structured, professional response.
+
+Audience: {audience}.
+Instructions:
+1) Begin with an overview summary ({overview_lines}).
+2) Follow with key findings and insights ({bullet_points}).
+3) Keep the tone {tone_note}.
+4) {length_instruction}
+5) Keep total length near {word_limit} words.
+6) {"Use concise bullets." if output_style.startswith("Structured") else "Write it as a short narrative paragraph."}
+"""
+
+    contents = [{
+        "role": "user",
+        "parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": rec["mime"], "data": rec["b64"]}},
+        ],
+    }]
+
+    try:
+        response = client.models.generate_content(model=model_name, contents=contents)
+        return (getattr(response, "text", "") or "").strip() or "No insights generated."
+    except Exception as e:
+        return f"API Error: {e}"
+
+# =========================
+# Colors and Styles
+# =========================
+PALE_PINK = "#FFDDEE"
+PEACH = "#FFE5B4"
+
+st.markdown(
+    f"""
+    <style>
+    /* Style Streamlit tabs for Home and Ask */
+    div[data-testid="stHorizontalBlock"] > div:nth-child(1) > div[data-testid="stTab"] {{
+        background-color: {PALE_PINK} !important;
+        border-radius: 5px 5px 0 0 !important;
+        padding: 10px 15px !important;
+    }}
+    div[data-testid="stHorizontalBlock"] > div:nth-child(2) > div[data-testid="stTab"] {{
+        background-color: {PEACH} !important;
+        border-radius: 5px 5px 0 0 !important;
+        padding: 10px 15px !important;
+    }}
+
+    /* Style for horizontal control row */
+    .control-row > div {{
+        display: inline-block;
+        vertical-align: middle;
+        margin-right: 12px;
+        background: #fff0f5;
+        border-radius: 8px;
+        padding: 8px 12px;
+    }}
+
+    /* Adjust chat message box colors for clarity */
+    [data-testid="stChatMessage"] {{
+        max-width: 80%;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# =========================
+# Controls row with dynamic word limit based on audience
+# =========================
+def render_controls_row():
+    cols = st.columns([1.3, 1.3, 1.3, 1.3], gap="large")
+    with cols[0]:
+        st.session_state.model_name = st.selectbox(
+            "Model",
+            MODEL_CHOICES,
+            index=(MODEL_CHOICES.index(st.session_state.model_name)
+                   if st.session_state.model_name in MODEL_CHOICES else 0),
+            help="Use flash for speed; pro for higher quality."
+        )
+    with cols[1]:
+        max_word_limit = 300 if st.session_state.audience == "Business Professional" else 600
+        # Clamp current word_limit inside max for audience
+        if st.session_state.word_limit > max_word_limit:
+            st.session_state.word_limit = max_word_limit
+        st.session_state.word_limit = st.slider(
+            "Word limit", min_value=80, max_value=max_word_limit,
+            value=st.session_state.word_limit, step=20
+        )
+    with cols[2]:
+        st.session_state.output_style = st.selectbox(
+            "Output format",
+            ["Structured (bulleted)", "Narrative (story)"],
+            index=(0 if st.session_state.output_style.startswith("Structured") else 1)
+        )
+    with cols[3]:
+        st.session_state.audience = st.selectbox(
+            "Audience",
+            ["Business Professional", "Data Scientist"],
+            index=0 if st.session_state.audience == "Business Professional" else 1
+        )
+
+st.markdown('<div class="control-row">', unsafe_allow_html=True)
+render_controls_row()
+st.markdown('</div>', unsafe_allow_html=True)
+
+
+# =========================
+# Main App
+# =========================
+home_tab, ask_tab = st.tabs(["Home", "Ask"])
+
+with home_tab:
+    files = st.file_uploader(
+        "Upload chart images",
+        type=["png", "jpg", "jpeg", "webp", "bmp", "jfif"],
+        accept_multiple_files=True
+    )
+    if files:
+        st.session_state.uploads = decode_uploaded_files(files)
+
+    analyze = st.button("🔍 Analyze Charts", type="primary")
+
+    if analyze:
+        if not st.session_state.uploads:
+            st.error("Please upload at least one chart to analyze.")
+        else:
+            model_name = st.session_state.model_name
+            audience = st.session_state.audience
+            word_limit = st.session_state.word_limit
+            output_style = st.session_state.output_style
+
+            summary_blocks = []
+
+            # Individual analysis only
+            for idx, rec in enumerate(st.session_state.uploads, start=1):
+                st.markdown(f"### Chart {idx} — {rec['name']}")
+                col_chart, col_insight = st.columns([1, 2], gap="large")
+                with col_chart:
+                    st.image(rec["img"], caption=rec["name"], use_container_width=True)
+                with col_insight:
+                    with st.spinner(f"Analyzing {rec['name']} with {model_name}..."):
+                        insight = generate_individual_insight_from_rec(
+                            rec, audience, word_limit, model_name, output_style
+                        )
+                    st.markdown(insight)
+                    summary_blocks.append(f"Chart {idx} ({rec['name']}):\n{insight}")
+
+            st.session_state.analysis_summary = "\n\n---\n\n".join(summary_blocks)
+            st.success("✅ Analysis complete. Switch to the **Ask** tab to query the results.")
+
+with ask_tab:
+    st.header("❓ Ask a question about the charts")
+    if not st.session_state.analysis_summary:
+        st.info("No analysis found. Please analyze charts on the Home tab first.")
     else:
-        start, end = output_text.find("["), output_text.rfind("]")
-        if start != -1 and end != -1:
-            json_block = output_text[start:end+1]
+        user_input = st.chat_input("Type your question about the charts...")
+        if user_input:
+            prompt = (
+                "Answer based only on the analysis below.\n\n"
+                f"Context:\n{st.session_state.analysis_summary}\n\n"
+                "Question: " + user_input
+            )
+            contents = [{"role": "user", "parts": [{"text": prompt}]}]
+            with st.spinner(f"Getting answer from {st.session_state.model_name}..."):
+                try:
+                    res = client.models.generate_content(
+                        model=st.session_state.model_name,
+                        contents=contents
+                    )
+                    answer = (res.text or "").strip()
+                except Exception as e:
+                    st.error(f"API Error: {e}")
+                    answer = ""
+            if answer:
+                st.session_state.conversation.append({"user": user_input, "assistant": answer})
 
-    parsed = None
-    if json_block:
-        try:
-            parsed = json.loads(json_block)
-        except Exception:
-            pass
+        for msg in st.session_state.conversation:
+            st.chat_message("user").markdown(msg["user"])
+            st.chat_message("assistant").markdown(msg["assistant"])
 
-    if parsed:
-        st.subheader("Parsed JSON")
-        st.json(parsed)
-    else:
-        st.info("Couldn’t parse JSON; check raw output.")
-
-    if comparison:
-        st.subheader("Comparison")
-        st.markdown(comparison.strip())
-else:
-    st.info("Upload images and click **Analyze with Gemini**.")
+        with st.expander("Analysis Summary", expanded=False):
+            st.markdown(st.session_state.analysis_summary)
