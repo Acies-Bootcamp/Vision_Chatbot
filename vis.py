@@ -1,235 +1,386 @@
-import io, os, base64
-from PIL import Image
+# app.py — Chartify: Minimal 3-tab app with hidden preview + chat download
+# -----------------------------------------------------------------------
+# Quick Start:
+#   1) pip install streamlit python-dotenv pillow tinydb reportlab google-genai groq
+#   2) put GEMINI_API_KEY=... and GROQ_API_KEY=... in a .env file
+#   3) streamlit run app.py
+#
+# Tabs:
+#   • Home     → upload charts, run Single/Cross analysis, export PDF
+#   • Chat Bot → ask follow-ups using ONLY the latest analysis (hidden preview)
+#   • History  → browse/delete previous runs (with thumbnails)
+# -----------------------------------------------------------------------
+
+import os
+from typing import List, Dict, Any
+
 import streamlit as st
 from dotenv import load_dotenv
-from google import genai
+from PIL import Image
+from tinydb import TinyDB, where
 
-# -----------------------------
-# SETUP
-# -----------------------------
-load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    st.error("⚠️ Please set GEMINI_API_KEY in your .env file.")
-    st.stop()
-
-client = genai.Client(api_key=api_key)
-MODEL_NAME = "gemini-2.0-flash"
-
-# -----------------------------
-# PAGE CONFIG
-# -----------------------------
-st.set_page_config(page_title="ChartSense AI", layout="wide", page_icon="")
-
-# -----------------------------
-# SIDEBAR OPTIONS
-# -----------------------------
-st.sidebar.header("⚙️ Analysis Configuration")
-
-# User type
-person_type = st.sidebar.radio(
-    "Your Background",
-    ["Business Professional", "Technical Analyst"],
-    help="Select the profile that best matches your perspective."
+# Import only what we actually use from tools.py
+from tools import (
+    blue_theme_css, decode_uploaded_files, build_pdf_bytes,
+    generate_individual_insight_from_rec, generate_cross_chart_insight,
+    save_analysis, load_latest_analysis, load_analyses,
+    make_thumbnails, thumbnails_gallery, build_chat_markdown, _clear_current_run
 )
 
-# Analysis depth (merged previous Response Depth & Summary Length)
-analysis_depth = st.sidebar.radio(
-    "Analysis Depth",
-    ["Short & Crisp", "Detailed & Elaborate"],
-    help="Controls both the length and analytical depth of the generated insights."
-)
+# Local DB handle (same filename as tools.py uses)
+DB = TinyDB("analysis_history_db.json")
 
+# =============================================================================
+# Streamlit page + theme
+# =============================================================================
+st.set_page_config(page_title="Chartify", page_icon="", layout="wide")
+st.title("Chartify AI")
 
-# Individual or combined analysis
-result_type = st.sidebar.radio(
-    "Analysis Mode",
-    ["Individual", "Combined"],
-    help="Whether to generate insights per chart or a single combined report."
-)
+blue_theme_css()
 
-# -----------------------------
-# DYNAMIC CSS
-# -----------------------------
-max_height = "500px" if result_type == "Combined" else "350px"
+# =============================================================================
+# Session State (what we keep between reruns)
+# =============================================================================
+def _init_state():
+    st.session_state.setdefault("uploads", [])                 # [{name, data, img, b64, mime}]
+    st.session_state.setdefault("analysis_summary", "")
+    st.session_state.setdefault("analysis_details", [])        # [{name, insight}]
+    st.session_state.setdefault("combined_insight", "")
+    st.session_state.setdefault("analysis_done", False)
+    st.session_state.setdefault("pdf_bytes", None)
+    st.session_state.setdefault("latest_thumbs", [])
+    st.session_state.setdefault("rendered_inline", False)      # prevents double-render after progressive flow
 
-st.markdown(f"""
-<style>
-.stButton>button {{
-    background-color: #4CAF50; color: white; height: 40px; width: 150px;
-    border-radius: 10px; border: none; font-size: 16px;
-}}
-.stButton>button:hover {{background-color: #45a049;}}
-div.stFileUploader {{border: 2px dashed #4CAF50; border-radius: 10px; padding: 20px;}}
-.insight-card {{
-    background-color: #f9f9f9;
-    padding: 15px;
-    border-radius: 10px;
-    margin-bottom: 15px;
-    box-shadow: 1px 1px 5px rgba(0,0,0,0.1);
-    max-height: {max_height};
-    overflow-y: auto;
-}}
-[data-testid="stSidebar"] > div:first-child {{
-    background-color: #f0f2f6;
-    padding: 15px;
-}}
-</style>
-""", unsafe_allow_html=True)
+    # settings
+    st.session_state.setdefault("model_name", "gemini-2.0-flash")  # default
+    st.session_state.setdefault("output_style", "Structured (bulleted)")
+    st.session_state.setdefault("audience", "Business Professional")
+    st.session_state.setdefault("analysis_mode", "Single Chart Analysis")
 
-# -----------------------------
-# HEADER
-# -----------------------------
-with st.container():
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        st.image("logo.png", width=250)
-    with col2:
-        st.title("ChartSense AI")
-
-st.markdown("**Get crisp, professional insights from your charts.**")
-st.markdown("_Upload charts to get a short overview and key findings — individually or combined._")
-st.markdown("💡 **Tip:** Use the sidebar to control analysis depth and analysis mode.")
-st.markdown("---")
-
-# -----------------------------
-# UPLOAD SECTION
-# -----------------------------
-st.header("Upload Your Chart(s)")
-uploaded_files = st.file_uploader(
-    "Upload chart images (PNG/JPG). You can select multiple files.",
-    type=["png", "jpg", "jpeg"],
-    accept_multiple_files=True
-)
-
-# -----------------------------
-# GEMINI FUNCTIONS
-# -----------------------------
-def generate_individual_insight(file, person_type, analysis_depth):
-    """Analyze a single chart based on user preferences."""
-    image_bytes = file.read()
-    mime_type = "image/png" if file.name.lower().endswith("png") else "image/jpeg"
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    # Set lines/bullets based on depth
-    overview_lines = "1–2 lines" if analysis_depth == "Short & Crisp" else "2–3 lines"
-    bullet_points = "3–4 bullet points" if analysis_depth == "Short & Crisp" else "5–6 bullet points"
-    length_instruction = "Keep it concise." if analysis_depth == "Short & Crisp" else "Elaborate clearly but stay focused."
-
-    prompt = f"""
-You are a professional data analyst.
-Analyze the uploaded chart image and provide a structured, professional response.
-
-Audience: {person_type}.
-Analysis Depth: {analysis_depth}.
-
-Instructions:
-1. Begin with an **overview summary** of the chart ({overview_lines}).  
-2. Follow with **key findings and insights** ({bullet_points}).  
-3. Keep the tone aligned with the reader type — business-friendly if business professional, technically precise if analyst.  
-4. {length_instruction}
-"""
-
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[{"role": "user", "parts": [
-            {"text": prompt},
-            {"inline_data": {"mime_type": mime_type, "data": image_b64}}
-        ]}]
+    # Keep a snapshot of dropdown settings to detect changes (for clearing Home)
+    st.session_state.setdefault(
+        "prev_settings",
+        ("gemini-2.0-flash", "Single Chart Analysis", "Structured (bulleted)", "Business Professional")
     )
 
-    return getattr(response, "text", "").strip() or "No insights generated."
+    # Ask tab chat (not persisted)
+    st.session_state.setdefault("conversation", [])            # [{user, assistant}]
 
-def generate_combined_insight(files, person_type, analysis_depth):
-    """Analyze multiple charts together and discuss relationships."""
-    overview_lines = "1–2 lines" if analysis_depth == "Short & Crisp" else "2–3 lines"
-    bullet_points = "3–5 bullet points" if analysis_depth == "Short & Crisp" else "5–7 bullet points"
-    length_instruction = "Keep it concise." if analysis_depth == "Short & Crisp" else "Elaborate clearly but stay focused."
+_init_state()
 
-    contents = [{"role": "user", "parts": [
-        {"text": f"""
-You are a senior data analyst. You are given multiple related charts.
-Analyze them and provide a structured, professional combined insight report.
+# Supported models (one Google, one Groq multimodal)
+MODEL_CHOICES = [
+    "gemini-2.0-flash",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+]
 
-Audience: {person_type}.
-Analysis Depth: {analysis_depth}.
+# =============================================================================
+# Sidebar (Settings, Exports, Chat download)
+# =============================================================================
+with st.sidebar:
+    st.header("🛠️ Workspace")
 
-Instructions:
-1. Begin with an **overall overview** summarizing what all charts collectively show ({overview_lines}).  
-2. Provide **cross-chart insights** ({bullet_points}), highlighting relationships, correlations, or contrasts.  
-3. Avoid repeating similar facts. Keep the response concise and professional, aligned with the selected audience.  
-{length_instruction}
-"""}
-    ]}]
+    # Model selector
+    st.session_state.model_name = st.selectbox(
+        "Model provider & mode",
+        MODEL_CHOICES,
+        index=(MODEL_CHOICES.index(st.session_state.model_name)
+               if st.session_state.model_name in MODEL_CHOICES else 0),
+        help="Engine used to analyze charts and answer follow-ups."
+    )
 
-    for file in files:
-        image_bytes = file.read()
-        mime_type = "image/png" if file.name.lower().endswith("png") else "image/jpeg"
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        contents[0]["parts"].append({"inline_data": {"mime_type": mime_type, "data": image_b64}})
+    # Analysis scope
+    st.session_state.analysis_mode = st.selectbox(
+        "Analysis scope",
+        ["Single Chart Analysis", "Cross Chart Analysis"],
+        index=(0 if st.session_state.analysis_mode == "Single Chart Analysis" else 1),
+        help="Single = one-by-one insights. Cross = combined insights across all uploads."
+    )
 
-    response = client.models.generate_content(model=MODEL_NAME, contents=contents)
-    return getattr(response, "text", "").strip() or "No insights generated."
+    # Output style
+    st.session_state.output_style = st.selectbox(
+        "Answer style",
+        ["Structured (bulleted)", "Narrative (story)"],
+        index=(0 if st.session_state.output_style.startswith("Structured") else 1),
+        help="Choose concise bullets or a short narrative."
+    )
 
-# -----------------------------
-# MAIN LOGIC
-# -----------------------------
-show_question = False
+    # Audience tone
+    st.session_state.audience = st.selectbox(
+        "Select that suits you : ",
+        ["Business Person", "Tech Person"],
+        index=0 if st.session_state.audience == "Business Professional" else 1,
+        help="Tunes wording and emphasis in the insights."
+    )
 
-if st.button("Analyze"):
-    if uploaded_files:
-        st.info("🔍 Generating insights… please wait.")
+    # Detect ANY change → clear current Home run (uploads + outputs)
+    prev = st.session_state.prev_settings
+    curr = (
+        st.session_state.model_name,
+        st.session_state.analysis_mode,
+        st.session_state.output_style,
+        st.session_state.audience,
+    )
+    if curr != prev:
+        _clear_current_run()
+        st.session_state.prev_settings = curr
+        st.toast("🧹 Settings changed — cleared current uploads and results.", icon="⚙️")
 
-        if result_type == "Individual":
-            for idx, file in enumerate(uploaded_files, start=1):
-                st.markdown(f"### Chart {idx}")
-                col_chart, col_insight = st.columns([1, 2], gap="large")
-                with col_chart:
-                    file.seek(0)
-                    st.image(file, caption=file.name, use_container_width=True)
-                with col_insight:
-                    file.seek(0)
-                    insight = generate_individual_insight(file, person_type, analysis_depth)
-                    st.markdown(
-                        f'<div class="insight-card"><b>Insights:</b><br>{insight}</div>',
-                        unsafe_allow_html=True
-                    )
-
-        else:  # Combined
-            st.markdown("### Combined Analysis Across All Charts")
-            col_chart, col_insight = st.columns([1, 2], gap="large")
-
-            with col_chart:
-                for file in uploaded_files:
-                    st.image(file, caption=file.name, use_container_width=True)
-
-            with col_insight:
-                for file in uploaded_files:
-                    file.seek(0)
-                combined_result = generate_combined_insight(uploaded_files, person_type, analysis_depth)
-                st.markdown(
-                    f'<div class="insight-card"><b>Combined Insights:</b><br>{combined_result}</div>',
-                    unsafe_allow_html=True
-                )
-
-        show_question = True
-    else:
-        st.error("Please upload at least one chart to analyze.")
-
-# -----------------------------
-# FOLLOW-UP QUESTION SECTION
-# -----------------------------
-if show_question:
-    st.markdown("---")
-    st.header("Have a question about the analysis?")
-    user_question = st.text_input("Ask your question here:")
-
-    if st.button("Submit Question"):
-        if user_question:
-            st.info("🤔 Thinking...")
-            followup_prompt = f"Based on the previous analysis, answer this question concisely: {user_question}"
-            response = client.models.generate_content(model=MODEL_NAME, contents=followup_prompt)
-            st.success(response.text.strip() if response.text else "No response generated.")
+    st.divider()
+    st.subheader("📄 Exports")
+    if st.button("⬇️ Prepare PDF Report"):
+        if not st.session_state.uploads or not st.session_state.analysis_summary:
+            st.warning("No analysis to export yet. Upload and run analysis first.")
+            st.session_state.pdf_bytes = None
         else:
-            st.warning("Please enter a question.")
+            st.session_state.pdf_bytes = build_pdf_bytes(
+                st.session_state.uploads, st.session_state.analysis_summary
+            )
+            st.toast("📄 PDF is ready — click Download.", icon="✅")
+
+    if st.session_state.get("pdf_bytes"):
+        st.download_button(
+            "Download PDF Report",
+            data=st.session_state.pdf_bytes,
+            file_name="Chart_Analysis_Report.pdf",
+            mime="application/pdf",
+            key="pdf_dl_btn"
+        )
+
+    st.divider()
+    st.subheader("💬 Conversation")
+    if st.session_state.conversation:
+        chat_md = build_chat_markdown(st.session_state.conversation)
+        st.download_button(
+            "Download Chat (.md)",
+            data=chat_md.encode("utf-8"),
+            file_name="chat_history.md",
+            mime="text/markdown",
+            key="chat_dl_btn"
+        )
+    else:
+        st.caption("No chat yet — ask a follow-up on the **Chat Bot** tab to enable download.")
+
+# =============================================================================
+# Tabs
+# =============================================================================
+home_tab, ask_tab, history_tab = st.tabs(["Home", "Chat Bot", "History"])
+
+# ── Home ───────────────────────────────────────────────────────────────────
+with home_tab:
+    st.subheader("📥 Upload & Analyze")
+    st.caption("Tip: For **Cross** analysis, upload multiple charts. For **Single**, you can still upload several; each gets its own insight.")
+
+    files = st.file_uploader(
+        "Drop chart images",
+        type=["png", "jpg", "jpeg", "webp", "bmp", "jfif"],
+        accept_multiple_files=True,
+        help="Accepted: PNG, JPG/JPEG, WEBP, BMP."
+    )
+    if files:
+        decoded = decode_uploaded_files(files)
+        if decoded:
+            st.session_state.uploads = decoded
+
+    analyze = st.button("🔍 Run Analysis", type="primary")
+
+    # Cross mode → offer a hidden preview of all charts
+    if st.session_state.analysis_mode == "Cross Chart Analysis" and st.session_state.uploads:
+        with st.expander("📉 Preview uploaded charts (optional)", expanded=False):
+            recs = st.session_state.uploads
+            cols = st.columns(min(4, max(1, len(recs))))
+            for i, rec in enumerate(recs):
+                with cols[i % len(cols)]:
+                    st.image(rec["img"], caption=rec["name"], use_container_width=True)
+
+    if analyze:
+        if not st.session_state.uploads:
+            st.error("Please upload charts to analyze.")
+        else:
+            model_name   = st.session_state.model_name
+            audience     = st.session_state.audience
+            output_style = st.session_state.output_style
+            mode         = st.session_state.analysis_mode
+
+            # Reset current outputs
+            st.session_state.analysis_details = []
+            st.session_state.combined_insight = ""
+            st.session_state.analysis_summary = ""
+            st.session_state.pdf_bytes = None
+            st.session_state.latest_thumbs = make_thumbnails(st.session_state.uploads)
+            st.session_state.rendered_inline = False
+
+            summary_blocks: List[str] = []
+
+            if mode == "Single Chart Analysis":
+                # Progressive rendering area
+                st.markdown("### 📈 Current Result")
+                results_area = st.container()
+
+                for rec in st.session_state.uploads:
+                    with results_area:
+                        st.markdown(f"#### {rec['name']}")
+                        col1, col2 = st.columns([1, 2])
+
+                        with col1:
+                            st.image(rec["img"], caption="Chart", use_container_width=True)
+
+                        with col2:
+                            insight_placeholder = st.empty()
+                            with st.spinner(f"Analyzing {rec['name']}…"):
+                                insight = generate_individual_insight_from_rec(
+                                    rec, audience, model_name, output_style
+                                )
+                            # show immediately
+                            insight_placeholder.markdown(insight)
+
+                    # update session + summary as we go (immediate persistence)
+                    st.session_state.analysis_details.append({"name": rec["name"], "insight": insight})
+                    summary_blocks.append(f"**{rec['name']}**\n\n{insight}")
+
+                # finalize shared summary for PDF/Chat
+                st.session_state.analysis_summary = "\n\n---\n\n".join(summary_blocks)
+                st.session_state.analysis_done = True
+                st.session_state.rendered_inline = True
+                st.toast("✅ Analysis complete.", icon="✅")
+
+                # Save to history with thumbnails + auto title
+                save_analysis({
+                    "analysis_mode": st.session_state.analysis_mode,
+                    "analysis_summary": st.session_state.analysis_summary,
+                    "analysis_details": st.session_state.analysis_details,
+                    "combined_insight": st.session_state.combined_insight,
+                    "thumbnails": st.session_state.latest_thumbs,
+                })
+
+            else:
+                # Cross mode stays as a single combined call (cannot stream parts easily)
+                with st.spinner("Aggregating cross-chart insights…"):
+                    combined = generate_cross_chart_insight(
+                        st.session_state.uploads, audience, model_name, output_style
+                    )
+                st.session_state.combined_insight = combined
+                st.session_state.analysis_summary = combined
+                st.session_state.analysis_done = True
+                st.toast("✅ Analysis complete.", icon="✅")
+
+                save_analysis({
+                    "analysis_mode": st.session_state.analysis_mode,
+                    "analysis_summary": st.session_state.analysis_summary,
+                    "analysis_details": st.session_state.analysis_details,
+                    "combined_insight": st.session_state.combined_insight,
+                    "thumbnails": st.session_state.latest_thumbs,
+                })
+
+    # Render the CURRENT run (no history here) — skip if we already rendered inline
+    if (
+        st.session_state.analysis_done
+        and st.session_state.analysis_summary
+        and st.session_state.uploads
+        and not st.session_state.get("rendered_inline")
+    ):
+        if st.session_state.analysis_mode == "Single Chart Analysis":
+            st.markdown("### 📈 Current Result")
+            name_to_insight = {d["name"]: d["insight"] for d in st.session_state.analysis_details}
+            for rec in st.session_state.uploads:
+                st.markdown(f"#### {rec['name']}")
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.image(rec["img"], caption="Chart", use_container_width=True)
+                with col2:
+                    st.markdown(name_to_insight.get(rec["name"], "No insight available."))
+        else:
+            st.subheader("🧠 Combined Cross-Chart Insights")
+            st.markdown(st.session_state.combined_insight)
+
+# ── Chat Bot (Ask) ─────────────────────────────────────────────────────────
+with ask_tab:
+    st.header("❓ Follow-up Q&A")
+
+    # Hidden preview of the latest analysis for context
+    with st.expander("🔎 Peek latest analysis (optional)", expanded=False):
+        latest = load_latest_analysis()
+        if latest:
+            st.markdown(latest.get("analysis_summary", ""))
+        else:
+            st.info("No analysis found yet. Run one on the Home tab.")
+
+    latest = load_latest_analysis()
+    if not latest:
+        st.info("Run an analysis first on the **Home** tab.")
+    else:
+        col_ask, col_clear = st.columns([0.8, 0.2])
+        with col_ask:
+            user_input = st.chat_input("Ask a question. Answers use ONLY the latest analysis…")
+        with col_clear:
+            if st.button("🧹 Clear chat"):
+                st.session_state.conversation = []
+                st.toast("Chat cleared.", icon="🧽")
+                st.rerun()
+
+        if user_input:
+            # IMPORTANT: We answer strictly from the analysis summary (no images here)
+            context = latest.get("analysis_summary", "")
+            prompt = f"Answer based only on the analysis below.\n\n{context}\n\nQuestion: {user_input}"
+            parts = [{"text": prompt}]
+            with st.spinner("Thinking…"):
+                from tools import _generate_with_backend  # import here to keep top clean
+                try:
+                    answer = _generate_with_backend(st.session_state.model_name, parts)
+                except Exception as e:
+                    answer = f"API Error: {e}"
+            st.session_state.conversation.append({"user": user_input, "assistant": answer})
+            st.toast("💬 Answer added to chat.", icon="✅")
+            st.rerun()
+
+        # Render chat messages
+        if not st.session_state.conversation:
+            st.info("No chat yet. Ask a question above.")
+        else:
+            for msg in st.session_state.conversation:
+                if msg.get("user"):
+                    st.chat_message("user").markdown(msg["user"])
+                if msg.get("assistant"):
+                    st.chat_message("assistant").markdown(msg["assistant"])
+
+# ── History ────────────────────────────────────────────────────────────────
+with history_tab:
+    st.header("📚 Past Runs")
+
+    analyses_tbl = DB.table("analyses")
+    items = load_analyses()
+
+    # Clear All
+    if items:
+        col1, col2 = st.columns([0.85, 0.15])
+        with col1:
+            st.caption(f"Showing {len(items)} saved analyses.")
+        with col2:
+            if st.button("🧹 Clear All History", use_container_width=True):
+                analyses_tbl.truncate()
+                st.toast("🧽 All history cleared from database.", icon="✅")
+                st.rerun()
+    else:
+        st.info("No saved analyses yet.")
+
+    # Cards
+    for h in items:
+        ts = h.get("ts", "")[:19].replace("T", " ")
+        title = h.get("title") or ("Single" if h.get("analysis_mode", "").startswith("Single") else "Cross")
+        label = f"{ts} — {title}"
+
+        cols = st.columns([0.95, 0.05])
+        with cols[0]:
+            exp = st.expander(label, expanded=False)
+        with cols[1]:
+            # Use timestamp as stable key for delete
+            if st.button("✖️", key=f"del_{ts}"):
+                analyses_tbl.remove(where("ts") == h["ts"])
+                st.toast(f"Deleted history entry from {ts}", icon="🗑️")
+                st.rerun()
+
+        with exp:
+            if h.get("thumbnails"):
+                thumbnails_gallery(h["thumbnails"])
+                st.markdown("---")
+            st.markdown(h.get("analysis_summary", ""))
