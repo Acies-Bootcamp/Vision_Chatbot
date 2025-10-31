@@ -41,6 +41,7 @@ analysis_depth = st.sidebar.radio(
     help="Controls both the length and analytical depth of the generated insights."
 )
 
+
 # Individual or combined analysis
 result_type = st.sidebar.radio(
     "Analysis Mode",
