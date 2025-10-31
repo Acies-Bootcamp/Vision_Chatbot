@@ -33,8 +33,8 @@ DB = TinyDB("analysis_history_db.json")
 # =============================================================================
 # Streamlit page + theme
 # =============================================================================
-st.set_page_config(page_title="Chartify", page_icon="📊", layout="wide")
-st.title("📊 Chartify")
+st.set_page_config(page_title="Chartify", page_icon="", layout="wide")
+st.title("Chartify AI")
 
 blue_theme_css()
 
@@ -107,8 +107,8 @@ with st.sidebar:
 
     # Audience tone
     st.session_state.audience = st.selectbox(
-        "Audience tone",
-        ["Business Professional", "Data Scientist"],
+        "Select that suits you : ",
+        ["Business Person", "Tech Person"],
         index=0 if st.session_state.audience == "Business Professional" else 1,
         help="Tunes wording and emphasis in the insights."
     )
